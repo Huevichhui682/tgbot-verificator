@@ -38,11 +38,20 @@ function escapeHtml(text: string) {
 }
 
 async function findUserByTgId(tgId: number) {
-  const { data } = await (supabase.from('users') as any)
+  // Old bot stored tg_id as user_id (primary key)
+  // New site users have user_id as autoincrement, tg_id in referal
+  // Check both: first by user_id (old bot rows), then by referal (new site rows)
+  const { data: byUserId } = await (supabase.from('users') as any)
+    .select('user_id, uuid, balance, nickname')
+    .eq('user_id', tgId)
+    .maybeSingle()
+  if (byUserId) return byUserId as { user_id: number; uuid: string; balance: number; nickname: string }
+
+  const { data: byReferal } = await (supabase.from('users') as any)
     .select('user_id, uuid, balance, nickname')
     .eq('referal', tgId)
     .maybeSingle()
-  return data as { user_id: number; uuid: string; balance: number; nickname: string } | null
+  return byReferal as { user_id: number; uuid: string; balance: number; nickname: string } | null
 }
 
 async function findUserByUuid(uuid: string) {
@@ -168,18 +177,25 @@ bot.onText(/^(\d{6})$/, async (msg, match) => {
     // In that case existingTg === webUser, still need to ensure MAX balance is saved
     
     if (existingTg && existingTg.uuid !== webUuid) {
-      // Переносим транзакции со старого uuid на новый
-      const { error: txErr } = await (supabase.from('transaction') as any)
-        .update({ uuid_user: webUuid })
-        .eq('uuid_user', existingTg.uuid)
-      if (txErr) console.error('TX transfer error:', txErr)
+      // Переносим транзакции со старого uuid на новый (только если uuid не null)
+      if (existingTg.uuid) {
+        const { error: txErr } = await (supabase.from('transaction') as any)
+          .update({ uuid_user: webUuid })
+          .eq('uuid_user', existingTg.uuid)
+        if (txErr) console.error('TX transfer error:', txErr)
+        else console.log(`Transferred transactions from ${existingTg.uuid} to ${webUuid}`)
+      }
 
-      // Удаляем старую строку бота
+      // Удаляем старую строку бота — по user_id если это старый бот-аккаунт
+      const deleteBy = existingTg.user_id === tgId
+        ? { field: 'user_id', value: tgId }  // old bot row: user_id = tgId
+        : { field: 'uuid', value: existingTg.uuid }  // new site row: uuid
       const { error: delErr } = await (supabase.from('users') as any)
         .delete()
-        .eq('uuid', existingTg.uuid)
+        .eq(deleteBy.field, deleteBy.value)
       if (delErr) console.error('Delete old user error:', delErr)
-    }
+      else console.log(`Deleted old user by ${deleteBy.field}=${deleteBy.value}`)
+    } // end if existingTg
 
     // ВСЕГДА обновляем web-аккаунт: пишем tg_id и МАКСИМАЛЬНЫЙ баланс из двух строк
     const { error: updErr, data: updData } = await (supabase.from('users') as any)
