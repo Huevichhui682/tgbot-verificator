@@ -162,8 +162,11 @@ bot.onText(/^(\d{6})$/, async (msg, match) => {
     const webBalance = Number(webUser?.balance ?? 0)
     const finalBalance = Math.max(botBalance, webBalance)
 
-    console.log(`Merge: botBalance=${botBalance}, webBalance=${webBalance}, final=${finalBalance}, sameUuid=${existingTg?.uuid === webUuid}`)
+    console.log(`Merge: tgId=${tgId} botUuid=${existingTg?.uuid} webUuid=${webUuid} botBal=${botBalance} webBal=${webBalance} final=${finalBalance}`)
 
+    // Also check if webUser itself already has this tgId (re-linking same account)
+    // In that case existingTg === webUser, still need to ensure MAX balance is saved
+    
     if (existingTg && existingTg.uuid !== webUuid) {
       // Переносим транзакции со старого uuid на новый
       const { error: txErr } = await (supabase.from('transaction') as any)
@@ -178,11 +181,14 @@ bot.onText(/^(\d{6})$/, async (msg, match) => {
       if (delErr) console.error('Delete old user error:', delErr)
     }
 
-    // Обновляем web-аккаунт: пишем tg_id и МАКСИМАЛЬНЫЙ баланс
-    const { error: updErr } = await (supabase.from('users') as any)
+    // ВСЕГДА обновляем web-аккаунт: пишем tg_id и МАКСИМАЛЬНЫЙ баланс из двух строк
+    const { error: updErr, data: updData } = await (supabase.from('users') as any)
       .update({ referal: tgId, balance: finalBalance })
       .eq('uuid', webUuid)
+      .select('balance, referal')
+      .single()
     if (updErr) console.error('Update web user error:', updErr)
+    else console.log('Updated user:', updData)
 
     const nickname = escapeHtml(webUser?.nickname ?? '—')
     const mergedMsg = existingTg && existingTg.uuid !== webUuid
