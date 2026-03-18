@@ -114,7 +114,7 @@ bot.onText(/📦 Мои заказы/, async (msg) => {
 
   const { data: orders } = await (supabase.from('transaction') as any)
     .select('id_transaction, name_of_stuff, amount, city, time_created, not_found')
-    .eq('uuid', user.uuid)
+    .eq('uuid_user', user.uuid)
     .order('time_created', { ascending: false })
     .limit(5)
 
@@ -125,7 +125,7 @@ bot.onText(/📦 Мои заказы/, async (msg) => {
 
   const lines = orders.map((o: any) => {
     const date   = new Date(o.time_created).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
-    const status = (o.not_found > 0) ? '⚠️' : '✅'
+    const status = (Number(o.not_found ?? 0) > 0) ? '⚠️' : '✅'
     return `${status} <b>${escapeHtml(o.name_of_stuff ?? '—')}</b>\n   ${o.amount ?? 0}€ · ${escapeHtml(o.city ?? '—')} · ${date}`
   }).join('\n\n')
 
@@ -157,28 +157,32 @@ bot.onText(/^(\d{6})$/, async (msg, match) => {
     const webUser    = await findUserByUuid(webUuid)
     const existingTg = await findUserByTgId(tgId)
 
-    let finalBalance = Number(webUser?.balance ?? 0)
+    // Считаем финальный баланс = MAX(bot_balance, web_balance)
+    const botBalance = Number(existingTg?.balance ?? 0)
+    const webBalance = Number(webUser?.balance ?? 0)
+    const finalBalance = Math.max(botBalance, webBalance)
+
+    console.log(`Merge: botBalance=${botBalance}, webBalance=${webBalance}, final=${finalBalance}, sameUuid=${existingTg?.uuid === webUuid}`)
 
     if (existingTg && existingTg.uuid !== webUuid) {
-      // Объединяем: берём максимальный баланс
-      finalBalance = Math.max(
-        Number(existingTg.balance ?? 0),
-        Number(webUser?.balance ?? 0)
-      )
-
       // Переносим транзакции со старого uuid на новый
-      await (supabase.from('transaction') as any)
-        .update({ uuid: webUuid })
-        .eq('uuid', existingTg.uuid)
+      const { error: txErr } = await (supabase.from('transaction') as any)
+        .update({ uuid_user: webUuid })
+        .eq('uuid_user', existingTg.uuid)
+      if (txErr) console.error('TX transfer error:', txErr)
 
-      // Удаляем старую строку
-      await supabase.from('users').delete().eq('uuid', existingTg.uuid)
+      // Удаляем старую строку бота
+      const { error: delErr } = await (supabase.from('users') as any)
+        .delete()
+        .eq('uuid', existingTg.uuid)
+      if (delErr) console.error('Delete old user error:', delErr)
     }
 
-    // Обновляем web-аккаунт: пишем tg_id и финальный баланс
-    await (supabase.from('users') as any)
+    // Обновляем web-аккаунт: пишем tg_id и МАКСИМАЛЬНЫЙ баланс
+    const { error: updErr } = await (supabase.from('users') as any)
       .update({ referal: tgId, balance: finalBalance })
       .eq('uuid', webUuid)
+    if (updErr) console.error('Update web user error:', updErr)
 
     const nickname = escapeHtml(webUser?.nickname ?? '—')
     const mergedMsg = existingTg && existingTg.uuid !== webUuid
