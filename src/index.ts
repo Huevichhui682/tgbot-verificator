@@ -3,7 +3,6 @@ import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
 dotenv.config()
 
-// ── Config ────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.BOT_TOKEN!
 const SUPABASE_URL = process.env.SUPABASE_URL!
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -13,7 +12,7 @@ const REDIS_TOKEN  = process.env.UPSTASH_REDIS_REST_TOKEN!
 const bot      = new TelegramBot(BOT_TOKEN, { polling: true })
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 
-// ── Upstash Redis helpers ─────────────────────────────────────
+// ── Redis ─────────────────────────────────────────────────────
 async function redisGet(key: string): Promise<string | null> {
   try {
     const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
@@ -23,7 +22,6 @@ async function redisGet(key: string): Promise<string | null> {
     return j.result ?? null
   } catch { return null }
 }
-
 async function redisDel(key: string): Promise<void> {
   try {
     await fetch(`${REDIS_URL}/del/${encodeURIComponent(key)}`, {
@@ -32,38 +30,46 @@ async function redisDel(key: string): Promise<void> {
   } catch {}
 }
 
-// ── Supabase helpers ──────────────────────────────────────────
-function escapeHtml(text: string) {
-  return String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+// ── Helpers ───────────────────────────────────────────────────
+function esc(t: string) {
+  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
 }
 
-async function findUserByTgId(tgId: number) {
-  // Old bot stored tg_id as user_id (primary key)
-  // New site users have user_id as autoincrement, tg_id in referal
-  // Check both: first by user_id (old bot rows), then by referal (new site rows)
-  const { data: byUserId } = await (supabase.from('users') as any)
+type UserRow = { user_id: number; uuid: string | null; balance: number; nickname: string }
+
+// Найти строку где user_id = tgId (старый бот-аккаунт)
+async function findBotRow(tgId: number): Promise<UserRow | null> {
+  const { data } = await (supabase.from('users') as any)
     .select('user_id, uuid, balance, nickname')
     .eq('user_id', tgId)
     .maybeSingle()
-  if (byUserId) return byUserId as { user_id: number; uuid: string; balance: number; nickname: string }
-
-  const { data: byReferal } = await (supabase.from('users') as any)
-    .select('user_id, uuid, balance, nickname')
-    .eq('referal', tgId)
-    .maybeSingle()
-  return byReferal as { user_id: number; uuid: string; balance: number; nickname: string } | null
+  return data ?? null
 }
 
-async function findUserByUuid(uuid: string) {
+// Найти строку по uuid (сайтовый аккаунт)
+async function findWebRow(uuid: string): Promise<UserRow | null> {
   const { data } = await (supabase.from('users') as any)
     .select('user_id, uuid, balance, nickname')
     .eq('uuid', uuid)
     .maybeSingle()
-  return data as { user_id: number; uuid: string; balance: number; nickname: string } | null
+  return data ?? null
+}
+
+// Найти актуальную строку пользователя для бота (с uuid → это рабочий аккаунт)
+async function findActiveRow(tgId: number): Promise<UserRow | null> {
+  // Сначала ищем строку где user_id=tgId И uuid уже проставлен (после слияния)
+  const botRow = await findBotRow(tgId)
+  if (botRow && botRow.uuid) return botRow
+  // Иначе ищем по referal=tgId (если слияние было через referal)
+  const { data } = await (supabase.from('users') as any)
+    .select('user_id, uuid, balance, nickname')
+    .eq('referal', tgId)
+    .maybeSingle()
+  return data ?? botRow ?? null
 }
 
 // ── Keyboard ──────────────────────────────────────────────────
-const mainKeyboard = {
+const kb = {
   keyboard: [
     [{ text: '🔗 Привязать аккаунт' }],
     [{ text: '💰 Мой баланс' }, { text: '📦 Мои заказы' }],
@@ -75,73 +81,61 @@ const mainKeyboard = {
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id
   const tgId   = msg.from!.id
-  const name   = escapeHtml(msg.from!.first_name ?? 'Путник')
+  const name   = esc(msg.from!.first_name ?? 'Путник')
+  const user   = await findActiveRow(tgId)
 
-  const existing = await findUserByTgId(tgId)
+  const text = user?.uuid
+    ? `👋 С возвращением, <b>${name}</b>!\n\n🏰 Аккаунт привязан.\n\nНикнейм: <b>${esc(user.nickname ?? '—')}</b>\nБаланс: <b>${user.balance ?? 0} ₮</b>\n\nДля смены аккаунта нажми <b>🔗 Привязать аккаунт</b>.`
+    : `👋 Добро пожаловать, <b>${name}</b>!\n\n🏰 <b>Тридевятое Царство</b>\n\nДля привязки аккаунта сайта:\n\n<b>1.</b> Зайди на сайт → Профиль\n<b>2.</b> Нажми <b>«Привязать Telegram»</b>\n<b>3.</b> Получи 6-значный код\n<b>4.</b> Отправь его сюда\n\nПосле этого баланс, заказы и история объединятся.`
 
-  const text = existing
-    ? `👋 С возвращением, <b>${name}</b>!\n\n🏰 Твой аккаунт уже привязан к сайту.\n\nНикнейм: <b>${escapeHtml(existing.nickname ?? '—')}</b>\nБаланс: <b>${existing.balance ?? 0} ₮</b>\n\nЧтобы привязать другой аккаунт — нажми <b>🔗 Привязать аккаунт</b>.`
-    : `👋 Добро пожаловать, <b>${name}</b>!\n\n🏰 <b>Тридевятое Царство</b>\nВерификационный бот\n\n━━━━━━━━━━━━━━━\n\nДля привязки аккаунта сайта к Telegram:\n\n<b>1.</b> Зайди на сайт → Профиль\n<b>2.</b> Нажми <b>«Привязать Telegram»</b>\n<b>3.</b> Получи 6-значный код\n<b>4.</b> Отправь его сюда\n\n📌 Это объединит баланс, заказы и историю сайта и бота в одно.`
-
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: mainKeyboard })
+  await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb })
 })
 
-// ── Привязать аккаунт ─────────────────────────────────────────
+// ── Привязать ─────────────────────────────────────────────────
 bot.onText(/🔗 Привязать аккаунт/, async (msg) => {
   await bot.sendMessage(msg.chat.id,
-    `🔑 <b>Привязка аккаунта</b>\n\n━━━━━━━━━━━━━━━\n\n<b>Шаг 1.</b> Открой <b>farkgdm.shop</b>\n<b>Шаг 2.</b> Зайди в <b>Профиль</b>\n<b>Шаг 3.</b> Нажми кнопку <b>«Привязать Telegram»</b>\n<b>Шаг 4.</b> Скопируй 6-значный код\n<b>Шаг 5.</b> Отправь его в этот чат\n\n━━━━━━━━━━━━━━━\n⏱ Код действует <b>10 минут</b>`,
+    `🔑 <b>Привязка аккаунта</b>\n\n<b>1.</b> Открой <b>farkgdm.shop</b>\n<b>2.</b> Профиль → <b>«Привязать Telegram»</b>\n<b>3.</b> Скопируй 6-значный код\n<b>4.</b> Отправь его сюда\n\n<i>⏱ Код действует 10 минут</i>`,
     { parse_mode: 'HTML' }
   )
 })
 
 // ── Баланс ────────────────────────────────────────────────────
 bot.onText(/💰 Мой баланс/, async (msg) => {
-  const user = await findUserByTgId(msg.from!.id)
-  if (!user) {
-    await bot.sendMessage(msg.chat.id,
-      '❌ Аккаунт не привязан.\n\nНажми <b>🔗 Привязать аккаунт</b>.',
-      { parse_mode: 'HTML', reply_markup: mainKeyboard }
-    )
+  const user = await findActiveRow(msg.from!.id)
+  if (!user?.uuid) {
+    await bot.sendMessage(msg.chat.id, '❌ Аккаунт не привязан.\n\nНажми <b>🔗 Привязать аккаунт</b>.', { parse_mode: 'HTML', reply_markup: kb })
     return
   }
   await bot.sendMessage(msg.chat.id,
-    `💰 <b>Баланс</b>\n\n<b>${user.balance ?? 0} ₮</b> USDT\n\nНикнейм: ${escapeHtml(user.nickname ?? '—')}`,
-    { parse_mode: 'HTML', reply_markup: mainKeyboard }
+    `💰 <b>Баланс</b>\n\n<b>${user.balance ?? 0} ₮</b>\n\nНикнейм: ${esc(user.nickname ?? '—')}`,
+    { parse_mode: 'HTML', reply_markup: kb }
   )
 })
 
-// ── Мои заказы ────────────────────────────────────────────────
+// ── Заказы ────────────────────────────────────────────────────
 bot.onText(/📦 Мои заказы/, async (msg) => {
-  const user = await findUserByTgId(msg.from!.id)
-  if (!user) {
-    await bot.sendMessage(msg.chat.id,
-      '❌ Аккаунт не привязан.\n\nНажми <b>🔗 Привязать аккаунт</b>.',
-      { parse_mode: 'HTML', reply_markup: mainKeyboard }
-    )
+  const user = await findActiveRow(msg.from!.id)
+  if (!user?.uuid) {
+    await bot.sendMessage(msg.chat.id, '❌ Аккаунт не привязан.\n\nНажми <b>🔗 Привязать аккаунт</b>.', { parse_mode: 'HTML', reply_markup: kb })
     return
   }
-
   const { data: orders } = await (supabase.from('transaction') as any)
     .select('id_transaction, name_of_stuff, amount, city, time_created, not_found')
     .eq('uuid_user', user.uuid)
     .order('time_created', { ascending: false })
     .limit(5)
 
-  if (!orders || orders.length === 0) {
-    await bot.sendMessage(msg.chat.id, '📦 Заказов пока нет.', { reply_markup: mainKeyboard })
+  if (!orders?.length) {
+    await bot.sendMessage(msg.chat.id, '📦 Заказов пока нет.', { reply_markup: kb })
     return
   }
-
   const lines = orders.map((o: any) => {
     const date   = new Date(o.time_created).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' })
-    const status = (Number(o.not_found ?? 0) > 0) ? '⚠️' : '✅'
-    return `${status} <b>${escapeHtml(o.name_of_stuff ?? '—')}</b>\n   ${o.amount ?? 0}€ · ${escapeHtml(o.city ?? '—')} · ${date}`
+    const status = Number(o.not_found ?? 0) > 0 ? '⚠️' : '✅'
+    return `${status} <b>${esc(o.name_of_stuff ?? '—')}</b>\n   ${o.amount ?? 0}€ · ${esc(o.city ?? '—')} · ${date}`
   }).join('\n\n')
 
-  await bot.sendMessage(msg.chat.id,
-    `📦 <b>Последние заказы</b>\n\n${lines}`,
-    { parse_mode: 'HTML', reply_markup: mainKeyboard }
-  )
+  await bot.sendMessage(msg.chat.id, `📦 <b>Последние заказы</b>\n\n${lines}`, { parse_mode: 'HTML', reply_markup: kb })
 })
 
 // ── 6-значный код ─────────────────────────────────────────────
@@ -153,87 +147,78 @@ bot.onText(/^(\d{6})$/, async (msg, match) => {
   const webUuid = await redisGet(`verify:${code}`)
   if (!webUuid) {
     await bot.sendMessage(chatId,
-      '❌ <b>Код не найден или истёк</b>\n\nЗапроси новый код в профиле на сайте.\nКод действует 10 минут.',
+      '❌ <b>Код не найден или истёк</b>\n\nЗапроси новый код в профиле на сайте.',
       { parse_mode: 'HTML' }
     )
     return
   }
-
-  // Удаляем одноразовый код
   await redisDel(`verify:${code}`)
 
   try {
-    const webUser    = await findUserByUuid(webUuid)
-    const existingTg = await findUserByTgId(tgId)
+    const webRow = await findWebRow(webUuid)   // сайтовая строка (uuid=webUuid)
+    const botRow = await findBotRow(tgId)       // бот-строка (user_id=tgId)
 
-    // Считаем финальный баланс = MAX(bot_balance, web_balance)
-    const botBalance = Number(existingTg?.balance ?? 0)
-    const webBalance = Number(webUser?.balance ?? 0)
-    const finalBalance = Math.max(botBalance, webBalance)
+    const webBalance = Number(webRow?.balance ?? 0)
+    const botBalance = Number(botRow?.balance ?? 0)
+    const finalBalance = Math.max(webBalance, botBalance)
 
-    console.log(`Merge: tgId=${tgId} botUuid=${existingTg?.uuid} webUuid=${webUuid} botBal=${botBalance} webBal=${webBalance} final=${finalBalance}`)
+    console.log(`LINK: tgId=${tgId} webUuid=${webUuid} webBal=${webBalance} botBal=${botBalance} final=${finalBalance}`)
 
-    // Also check if webUser itself already has this tgId (re-linking same account)
-    // In that case existingTg === webUser, still need to ensure MAX balance is saved
-    
-    if (existingTg && existingTg.uuid !== webUuid) {
-      // Переносим транзакции со старого uuid на новый (только если uuid не null)
-      if (existingTg.uuid) {
-        const { error: txErr } = await (supabase.from('transaction') as any)
+    if (botRow) {
+      // Есть старая бот-строка (user_id=tgId)
+      // Стратегия: пишем webUuid в бот-строку, ставим MAX баланс, удаляем сайтовую
+
+      // Переносим транзакции с webUuid на botRow.uuid (если у botRow есть свой uuid)
+      if (botRow.uuid && botRow.uuid !== webUuid) {
+        await (supabase.from('transaction') as any)
           .update({ uuid_user: webUuid })
-          .eq('uuid_user', existingTg.uuid)
-        if (txErr) console.error('TX transfer error:', txErr)
-        else console.log(`Transferred transactions from ${existingTg.uuid} to ${webUuid}`)
+          .eq('uuid_user', botRow.uuid)
+        console.log(`Transferred txs from botUuid=${botRow.uuid} to webUuid=${webUuid}`)
       }
 
-      // Удаляем старую строку бота — по user_id если это старый бот-аккаунт
-      const deleteBy = existingTg.user_id === tgId
-        ? { field: 'user_id', value: tgId }  // old bot row: user_id = tgId
-        : { field: 'uuid', value: existingTg.uuid }  // new site row: uuid
-      const { error: delErr } = await (supabase.from('users') as any)
-        .delete()
-        .eq(deleteBy.field, deleteBy.value)
-      if (delErr) console.error('Delete old user error:', delErr)
-      else console.log(`Deleted old user by ${deleteBy.field}=${deleteBy.value}`)
-    } // end if existingTg
+      // Пишем webUuid и MAX баланс в бот-строку (user_id=tgId остаётся)
+      await (supabase.from('users') as any)
+        .update({ uuid: webUuid, balance: finalBalance, nickname: webRow?.nickname ?? botRow.nickname })
+        .eq('user_id', tgId)
+      console.log(`Updated bot row user_id=${tgId} → uuid=${webUuid} balance=${finalBalance}`)
 
-    // ВСЕГДА обновляем web-аккаунт: пишем tg_id и МАКСИМАЛЬНЫЙ баланс из двух строк
-    const { error: updErr, data: updData } = await (supabase.from('users') as any)
-      .update({ referal: tgId, balance: finalBalance })
-      .eq('uuid', webUuid)
-      .select('balance, referal')
-      .single()
-    if (updErr) console.error('Update web user error:', updErr)
-    else console.log('Updated user:', updData)
+      // Удаляем сайтовую строку (она теперь перенесена в бот-строку)
+      if (webRow && webRow.user_id !== tgId) {
+        await (supabase.from('users') as any)
+          .delete()
+          .eq('user_id', webRow.user_id)
+        console.log(`Deleted web row user_id=${webRow.user_id}`)
+      }
 
-    const nickname = escapeHtml(webUser?.nickname ?? '—')
-    const mergedMsg = existingTg && existingTg.uuid !== webUuid
-      ? `✅ <b>Аккаунты объединены!</b>\n\nТранзакции перенесены.\nБаланс объединён: <b>${finalBalance} ₮</b>`
-      : `✅ <b>Telegram привязан!</b>\n\nНикнейм: <b>${nickname}</b>\nБаланс: <b>${finalBalance} ₮</b>`
+      await bot.sendMessage(chatId,
+        `✅ <b>Аккаунты объединены!</b>\n\nБаланс: <b>${finalBalance} ₮</b>\nНикнейм: <b>${esc(webRow?.nickname ?? botRow.nickname ?? '—')}</b>\n\n🏰 Сайт и бот — одно целое!`,
+        { parse_mode: 'HTML', reply_markup: kb }
+      )
+    } else {
+      // Бот-строки нет — просто помечаем сайтовую строку как привязанную
+      await (supabase.from('users') as any)
+        .update({ balance: finalBalance })
+        .eq('uuid', webUuid)
+      console.log(`No bot row, just updated web row uuid=${webUuid} balance=${finalBalance}`)
 
-    await bot.sendMessage(chatId,
-      `${mergedMsg}\n\n🏰 Теперь сайт и бот — одно целое!\nЗаказы, баланс и история синхронизированы.`,
-      { parse_mode: 'HTML', reply_markup: mainKeyboard }
-    )
+      await bot.sendMessage(chatId,
+        `✅ <b>Telegram привязан!</b>\n\nНикнейм: <b>${esc(webRow?.nickname ?? '—')}</b>\nБаланс: <b>${finalBalance} ₮</b>\n\n🏰 Теперь сайт и бот синхронизированы!`,
+        { parse_mode: 'HTML', reply_markup: kb }
+      )
+    }
   } catch (err) {
     console.error('Verification error:', err)
-    await bot.sendMessage(chatId,
-      '⚠️ Произошла ошибка. Попробуй позже или обратись к оператору.',
-      { parse_mode: 'HTML' }
-    )
+    await bot.sendMessage(chatId, '⚠️ Произошла ошибка. Попробуй позже.', { parse_mode: 'HTML' })
   }
 })
 
 // ── Прочие сообщения ──────────────────────────────────────────
 bot.on('message', (msg) => {
-  const text = msg.text ?? ''
-  if (text.startsWith('/') || /^[🔗💰📦]/.test(text) || /^\d{6}$/.test(text)) return
-  bot.sendMessage(msg.chat.id,
-    '👆 Используй кнопки меню или отправь 6-значный код.',
-    { reply_markup: mainKeyboard }
-  )
+  const t = msg.text ?? ''
+  if (t.startsWith('/') || /^[🔗💰📦]/.test(t) || /^\d{6}$/.test(t)) return
+  bot.sendMessage(msg.chat.id, '👆 Используй кнопки меню или отправь 6-значный код.', { reply_markup: kb })
 })
 
 console.log('🤖 Verificator bot started')
-process.on('uncaughtException', (e) => console.error('Uncaught:', e))
-process.on('unhandledRejection', (e) => console.error('Unhandled:', e))
+process.on('uncaughtException', e => console.error('Uncaught:', e))
+process.on('unhandledRejection', e => console.error('Unhandled:', e))
